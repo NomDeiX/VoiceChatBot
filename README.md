@@ -1,4 +1,4 @@
-# 🎙️ Pipecat Voice Chatbot
+# Pipecat Voice Chatbot
 
 A real-time voice assistant built with [Pipecat](https://github.com/pipecat-ai/pipecat), FastAPI, and WebSockets.
 
