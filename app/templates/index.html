@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Pipecat Voice Bot</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 600px;
+            margin: 50px auto;
+            padding: 20px;
+        }
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            margin: 5px;
+            cursor: pointer;
+        }
+        #status {
+            margin: 20px 0;
+            padding: 10px;
+            border-radius: 5px;
+            font-weight: bold;
+        }
+        .listening { background-color: #90EE90; }
+        .bot-speaking { background-color: #FFB6C1; }
+        .not-connected { background-color: #D3D3D3; }
+    </style>
+</head>
+<body>
+    <h1>Pipecat Voice Chatbot</h1>
+    <button id="startBtn">Start Call</button>
+    <button id="stopBtn" disabled>Stop Call</button>
+    <p id="status" class="not-connected">Not connected</p>
+    
+    <script>
+        const SAMPLE_RATE = 16000;
+        const CHANNELS = 1;
+        
+        let ws = null;
+        let audioContext = null;
+        let mediaStream = null;
+        let workletNode = null;
+        let source = null;
+        let isBotSpeaking = false;
+        let micEnabled = true;
+        
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const status = document.getElementById('status');
+        
+        startBtn.onclick = startCall;
+        stopBtn.onclick = stopCall;
+        
+        function updateStatus(text, className) {
+            status.textContent = text;
+            status.className = className;
+        }
+        
+        async function startCall() {
+            try {
+                updateStatus('Connecting...', 'not-connected');
+                
+                // Get microphone access FIRST
+                mediaStream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        sampleRate: SAMPLE_RATE,
+                        channelCount: CHANNELS,
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    } 
+                });
+                
+                // Setup WebSocket
+                ws = new WebSocket(`ws://${window.location.host}/ws`);
+                ws.binaryType = 'arraybuffer';
+                
+                ws.onopen = async () => {
+                    updateStatus('Listening...', 'listening');
+                    startBtn.disabled = true;
+                    stopBtn.disabled = false;
+                    await setupAudio();
+                };
+                
+                ws.onclose = () => {
+                    updateStatus('Disconnected', 'not-connected');
+                    stopCall();
+                };
+                
+                ws.onerror = (error) => {
+                    console.error('WebSocket error:', error);
+                    updateStatus('Error', 'not-connected');
+                    stopCall();
+                };
+                
+                ws.onmessage = (event) => {
+                    if (event.data instanceof ArrayBuffer) {
+                        // Bot is sending audio - IMMEDIATELY disable microphone
+                        if (!isBotSpeaking) {
+                            isBotSpeaking = true;
+                            micEnabled = false;
+                            updateStatus('Bot speaking...', 'bot-speaking');
+                        }
+                        playAudio(event.data);
+                    }
+                };
+                
+            } catch (error) {
+                console.error('Error starting call:', error);
+                updateStatus('Error: ' + error.message, 'not-connected');
+                stopCall();
+            }
+        }
+        
+        async function setupAudio() {
+            // Create audio context
+            audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                sampleRate: SAMPLE_RATE
+            });
+            
+            // Load AudioWorklet processor
+            await audioContext.audioWorklet.addModule(createWorkletBlob());
+            
+            // Create source from microphone
+            source = audioContext.createMediaStreamSource(mediaStream);
+            
+            // Create worklet node for audio processing
+            workletNode = new AudioWorkletNode(audioContext, 'audio-capture-processor');
+            
+            // Handle audio data from worklet
+            workletNode.port.onmessage = (event) => {
+                // Only send audio when mic is enabled (bot not speaking)
+                if (ws && ws.readyState === WebSocket.OPEN && micEnabled) {
+                    ws.send(event.data.buffer);
+                }
+            };
+            
+            // Connect: source → worklet (no connection to destination = no echo!)
+            source.connect(workletNode);
+        }
+        
+        // Create AudioWorklet processor as a blob URL
+        function createWorkletBlob() {
+            const workletCode = `
+                class AudioCaptureProcessor extends AudioWorkletProcessor {
+                    constructor() {
+                        super();
+                        this.bufferSize = 4096;
+                        this.buffer = new Float32Array(this.bufferSize);
+                        this.bufferIndex = 0;
+                    }
+                    
+                    process(inputs, outputs, parameters) {
+                        const input = inputs[0];
+                        if (input.length > 0) {
+                            const inputChannel = input[0];
+                            
+                            for (let i = 0; i < inputChannel.length; i++) {
+                                this.buffer[this.bufferIndex++] = inputChannel[i];
+                                
+                                if (this.bufferIndex >= this.bufferSize) {
+                                    // Convert to Int16 and send
+                                    const int16Array = new Int16Array(this.bufferSize);
+                                    for (let j = 0; j < this.bufferSize; j++) {
+                                        const s = Math.max(-1, Math.min(1, this.buffer[j]));
+                                        int16Array[j] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                                    }
+                                    
+                                    this.port.postMessage(int16Array);
+                                    this.bufferIndex = 0;
+                                }
+                            }
+                        }
+                        return true;
+                    }
+                }
+                
+                registerProcessor('audio-capture-processor', AudioCaptureProcessor);
+            `;
+            
+            const blob = new Blob([workletCode], { type: 'application/javascript' });
+            return URL.createObjectURL(blob);
+        }
+        
+        // Audio playback queue with improved timing
+        let audioQueue = [];
+        let isPlaying = false;
+        let scheduledTime = 0;
+        let silenceTimer = null;
+        
+        function playAudio(pcmData) {
+            audioQueue.push(pcmData);
+            
+            if (!isPlaying) {
+                isPlaying = true;
+                scheduledTime = audioContext.currentTime;
+                processQueue();
+            }
+        }
+        
+        function processQueue() {
+            if (audioQueue.length === 0) {
+                // No more audio - wait a bit then re-enable mic
+                clearTimeout(silenceTimer);
+                silenceTimer = setTimeout(() => {
+                    if (audioQueue.length === 0) {
+                        isPlaying = false;
+                        isBotSpeaking = false;
+                        // Wait extra time before enabling mic to avoid echo tail
+                        setTimeout(() => {
+                            micEnabled = true;
+                            updateStatus('Listening...', 'listening');
+                            console.log('Microphone re-enabled');
+                        }, 800); // Increased to 800ms for better echo protection
+                    } else {
+                        processQueue();
+                    }
+                }, 300);
+                return;
+            }
+            
+            const pcmData = audioQueue.shift();
+            
+            try {
+                // Convert Int16 PCM to Float32
+                const int16Array = new Int16Array(pcmData);
+                const float32Array = new Float32Array(int16Array.length);
+                
+                for (let i = 0; i < int16Array.length; i++) {
+                    float32Array[i] = int16Array[i] / (int16Array[i] < 0 ? 0x8000 : 0x7FFF);
+                }
+                
+                // Create audio buffer
+                const audioBuffer = audioContext.createBuffer(
+                    CHANNELS,
+                    float32Array.length,
+                    SAMPLE_RATE
+                );
+                audioBuffer.getChannelData(0).set(float32Array);
+                
+                // Create and schedule source
+                const bufferSource = audioContext.createBufferSource();
+                bufferSource.buffer = audioBuffer;
+                bufferSource.connect(audioContext.destination);
+                
+                // Schedule for continuous playback
+                if (scheduledTime < audioContext.currentTime) {
+                    scheduledTime = audioContext.currentTime;
+                }
+                
+                bufferSource.start(scheduledTime);
+                scheduledTime += audioBuffer.duration;
+                
+                // Process next chunk immediately
+                processQueue();
+                
+            } catch (error) {
+                console.error('Error playing audio:', error);
+                processQueue();
+            }
+        }
+        
+        function stopCall() {
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+            updateStatus('Not connected', 'not-connected');
+            
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+            
+            if (workletNode) {
+                workletNode.disconnect();
+                workletNode = null;
+            }
+            
+            if (source) {
+                source.disconnect();
+                source = null;
+            }
+            
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(track => track.stop());
+                mediaStream = null;
+            }
+            
+            clearTimeout(silenceTimer);
+            audioQueue = [];
+            isPlaying = false;
+            isBotSpeaking = false;
+            micEnabled = true;
+            scheduledTime = 0;
+        }
+    </script>
+</body>
+</html>
